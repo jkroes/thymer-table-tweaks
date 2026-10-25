@@ -91,6 +91,28 @@ saves / Escape / click-away cancel), Next, native page select alongside ours.
   borrows a new internal, add it there. Re-decode recipe: table-view's CLAUDE.md
   ("Native table, decoded").
 
+## NEXT: switch from instance overrides to class patches (decided 2026-10-25)
+
+Keep ONE plugin; replace the per-table discovery (MutationObserver + tree walk + own
+properties) with patches on two classes, reached once from the first live table
+(`table.constructor.prototype`, `table.pagination.constructor.prototype`) or a collection
+component's internal `plugin.getViewTypeClass('table')`:
+- **Table class** (`hD`): `Ue`, `Ot`, `handleCommandPaletteContextOption`,
+  `updateStatusBarNumberOfItems`, `onKeyboardNavigation`, `ensureFocusInView`,
+  `applyHeaderStickiness`. Only native tables use it (bundle FX3P7QBW: registered solely
+  as view type "Table", no subclasses) — no guard needed. Methods are looked up per call,
+  so already-open tables pick the patches up; no fix-up.
+- **Pager class** (`Fh`): `setPaginationDetails` (view's size), `getPaginationNodes`
+  (picker + key tooltips). SHARED with the tasks view and the card views (list/gallery,
+  page 50), so guard on "parent is a native table" and pass through otherwise. Patching
+  `setPaginationDetails` at class level catches `setInitView`'s 75 during construction —
+  no first-paint race. Tables already open at patch time need a one-time size fix-up.
+- Safeguards for both: wrap a STORED original (private key on the prototype, so a hot
+  reload never wraps a wrapper); try/catch in every wrapper falling back to the original
+  (worst case = native behavior); onUnload restores the originals. Keep the INTERNALS
+  check, run once against the classes.
+- Still needs a one-time wait for the first table when no table is open at load.
+
 ## Open / unverified
 
 - Verified 2026-10-25: saving the view's Table Settings dialog keeps `opts.page_size` (the

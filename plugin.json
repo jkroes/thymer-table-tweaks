@@ -1,0 +1,6 @@
+{
+  "ver": 1,
+  "name": "Table Tweaks",
+  "icon": "table",
+  "description": "Fixes for the native table view: rows per page per view, a steady pinned header, page-turn keys."
+}

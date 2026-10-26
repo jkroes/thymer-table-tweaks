@@ -2,7 +2,7 @@
 
 Small improvements to [Thymer](https://thymer.com)'s built-in **Table** view. They apply to
 every table in your workspace. Your tables, columns and data stay exactly as they are; the
-plugin only changes how paging, the header and a few keys behave.
+plugin only changes how paging, sorting, the header and a few keys behave.
 
 ## Install
 
@@ -54,6 +54,33 @@ You can also do it from the keyboard: click into the table, open the command pal
 
   Set a key to `""` to turn it off.
 
+### Sort by several columns
+
+Native tables sort by one column at a time. With Table Tweaks you can sort by a column,
+then by another to order the rows that tie, and so on. For example, sort by Context,
+then by Target.
+
+Click into the table, open the command palette (⌘P) and choose **Sort View by…**. The
+entry also shows the current sort, e.g. "Sort View by… (Context ↑, Target ↑)". It opens
+a small menu:
+
+- **Sort by… / Then by…** adds a column, ascending or descending. Type to find it.
+- **Pick a column already in the sort** to flip its direction, move it up or down, or
+  remove it.
+- **Clear sort** goes back to the table's custom order. **Done** (or Escape) closes the
+  menu.
+
+Each change applies right away, and the menu comes back for the next one.
+
+- The sort is saved with the view, so it's still there after a reload and syncs to your
+  other devices. Each view has its own.
+- Values are compared the way Thymer compares them in a single-column sort. For example,
+  choice columns follow the order of their choices in the collection's settings, not
+  the alphabet.
+- Clicking a column header still works as usual. Clicking the first sort column flips
+  its direction and keeps the rest of the sort. Clicking any other header sorts by that
+  column alone; click the first sort column again to get your multi-column sort back.
+
 ### A column header that stays put
 
 When you scroll down a long table, Thymer pins the column header to the top. In the native
@@ -64,8 +91,9 @@ phone-sized layouts, where the header behaves natively.)
 ## Turning it off
 
 Disable or delete the plugin. Open tables go straight back to native behavior: 75 rows
-per page, Thymer's own header and keys. Page sizes you chose stay saved in your views and
-come back if you turn the plugin on again.
+per page, Thymer's own header and keys, sorted by the first column of your sort only.
+Page sizes and sorts you chose stay saved in your views and come back if you turn the
+plugin on again.
 
 ## How it works (for the curious)
 
@@ -94,4 +122,8 @@ Tweaks works with the app's own internal code. It does so carefully:
    Thymer shows a "Table Tweaks needs updating" notice instead.
 
 The page size lives in the view's own settings (as `page_size`), which is why it syncs
-like the rest of the view.
+like the rest of the view. So does the sort: its first column is saved as the view's
+normal sort, and the whole list of columns alongside it (as `sort`). To sort by several
+columns, the plugin asks Thymer to sort by each one in turn, starting with the last.
+Thymer's sort keeps tied rows in their existing order, so each earlier column decides
+the order and the later ones only order the rows that tie.

@@ -24,10 +24,13 @@ var plugins = (() => {
   __export(plugin_exports, {
     Plugin: () => Plugin
   });
+  var OPTIONS_COL = ":first_col";
   var PAGE_SIZES = [25, 50, 75, 100, 0];
   var NATIVE_PAGE_SIZE = 75;
   var STICKY_RANGE = 1e6;
   var PALETTE_ACTION = "table-tweaks.page_size";
+  var SORT_ACTION = "table-tweaks.sort";
+  var UNSORTABLE_TYPES = ["banner", "image", "file"];
   var INTERNALS = {
     methods: [
       "refresh",
@@ -42,7 +45,9 @@ var plugins = (() => {
       "onKeyboardNavigation",
       "startFocus",
       "addPropertyColumn",
-      "getPeekStatusBarContext"
+      "getPeekStatusBarContext",
+      "sortRows",
+      "setSortColumn"
     ],
     pagination: ["setPaginationDetails", "requestPage", "getPaginationNodes", "refresh"]
   };
@@ -234,9 +239,21 @@ var plugins = (() => {
     if (!(t.columnFields instanceof Map)) missing.push("columnFields");
     if (!t.verticalScrollNode) missing.push("verticalScrollNode");
     if (typeof t.plugin?.getConfiguration !== "function") missing.push("plugin.getConfiguration");
+    if (typeof t.plugin?.sortByField !== "function") missing.push("plugin.sortByField");
+    if (!(t.plugin?.fieldsById instanceof Map)) missing.push("plugin.fieldsById");
+    if (!Object.hasOwn(t, "plugin")) missing.push("own plugin");
     return missing;
   }
   __name(missingInternals, "missingInternals");
+  function sortKeys(t) {
+    const sc = t.sortColumn;
+    if (!sc?.fieldId) return [];
+    const first = { field: sc.fieldId, dir: sc.dir };
+    const saved = t.options?.viewConfig?.opts?.sort;
+    if (Array.isArray(saved) && saved.length > 1 && saved[0].field === sc.fieldId) return [first, ...saved.slice(1)];
+    return [first];
+  }
+  __name(sortKeys, "sortKeys");
   function pageSizeOf(t, fallback) {
     const n = t.options?.viewConfig?.opts?.page_size;
     return Number.isInteger(n) && n >= 0 ? n : fallback;
@@ -407,12 +424,58 @@ var plugins = (() => {
             icon: "ti-list-numbers",
             json: { size: n }
           })));
+          const keys = sortKeys(this);
+          palette.addStaticOptions([{
+            value: SORT_ACTION,
+            label: keys.length ? `Sort View by\u2026 (${keys.map((k) => plugin.keyLabel(this, k)).join(", ")})` : "Sort View by\u2026",
+            icon: "ti-arrows-sort"
+          }]);
         }),
         handleCommandPaletteContextOption: before("handleCommandPaletteContextOption", function(palette, option) {
+          if (option.value === SORT_ACTION) {
+            setTimeout(() => plugin.openSortMenu(this));
+            return true;
+          }
           if (option.value !== PALETTE_ACTION || !Number.isInteger(option.json?.size)) return false;
           plugin.setPageSize(this, option.json.size);
           return true;
         }),
+        // --- multi-column sort --------------------------------------------------
+        // Native sorts by one field (`plugin.sortByField`, stable). With a chain,
+        // that call sorts by each key from last to first, so earlier keys win
+        // and later ones break their ties. The swap is done on the table's own
+        // `plugin` for the length of the call, so native's stable-row-order
+        // bookkeeping (which writes to `this`) runs as usual.
+        sortRows: /* @__PURE__ */ __name((orig) => function(rows) {
+          let keys;
+          try {
+            keys = sortKeys(this);
+          } catch (e) {
+            plugin.reportError("sortRows", e);
+          }
+          if (!keys || keys.length < 2) return orig.call(this, rows);
+          const own = this.plugin;
+          this.plugin = Object.create(own, {
+            sortByField: {
+              value: /* @__PURE__ */ __name((items, _field, dir) => {
+                for (let i = keys.length - 1; i >= 0; i--) {
+                  const field = own.fieldsById.get(keys[i].field);
+                  if (field) items = own.sortByField(items, field, i === 0 ? dir : keys[i].dir);
+                }
+                return items;
+              }, "value")
+            }
+          });
+          try {
+            return orig.call(this, rows);
+          } catch (e) {
+            plugin.reportError("sortRows", e);
+            this.plugin = own;
+            return orig.call(this, rows);
+          } finally {
+            this.plugin = own;
+          }
+        }, "sortRows"),
         // --- page indicator + page-turn keys ----------------------------------
         // The pager sits below the rows, often off screen while the keyboard
         // turns pages, so the status bar's item count names the page too.
@@ -561,36 +624,124 @@ var plugins = (() => {
      * clears the setting.
      */
     async setPageSize(t, n) {
-      const vc = t.options.viewConfig;
-      vc.opts = { ...vc.opts, page_size: n };
-      if (n === NATIVE_PAGE_SIZE) delete vc.opts.page_size;
+      const edit = /* @__PURE__ */ __name((v) => {
+        v.opts = { ...v.opts, page_size: n };
+        if (n === NATIVE_PAGE_SIZE) delete v.opts.page_size;
+      }, "edit");
+      edit(t.options.viewConfig);
       const row = t.focusState.row;
       const index = row ? t.cachedRowItemsInViewBeforePagination.findIndex((r) => r.guid === row.guid) : -1;
       t.pagination.setPaginationDetails(null, n, n && index >= 0 ? Math.floor(index / n) : 0);
       t.refresh();
       t.ue();
+      if (!await this.saveView(t, edit)) this.ui.addToaster({ title: "Table Tweaks", message: "Couldn't save the page size; it applies until this view is reopened.", dismissible: true, autoDestroyTime: 5e3 });
+    }
+    /**
+     * Apply `edit` to a copy of the stored config's entry for this view and
+     * write it. Done the way the native "+" column saves `field_ids`:
+     * `addPropertyColumn` writes the config without reloading the collection's
+     * plugin. Handed the edited config and a column the view already has, that
+     * write is all it does. True once saved.
+     */
+    async saveView(t, edit) {
       const cfg = structuredClone(t.plugin.getConfiguration());
-      const v = cfg.views?.find((x) => x.id === vc.id);
-      let saved = false;
-      if (v?.field_ids?.length) {
-        v.opts = { ...v.opts, page_size: n };
-        if (n === NATIVE_PAGE_SIZE) delete v.opts.page_size;
-        const host = Object.create(t, {
-          plugin: { value: Object.create(t.plugin, { getConfiguration: { value: /* @__PURE__ */ __name(() => cfg, "value") } }), writable: true },
-          columnFields: { value: /* @__PURE__ */ new Map() },
-          columnSizes: { value: /* @__PURE__ */ new Map() },
-          bustAllNodeCache: { value: /* @__PURE__ */ __name(() => {
-          }, "value") },
-          refresh: { value: /* @__PURE__ */ __name(() => {
-          }, "value") }
-        });
-        try {
-          saved = await t.addPropertyColumn.call(host, { id: v.field_ids[0] }, false);
-        } catch (e) {
-          console.warn("[Table Tweaks] saving the page size failed:", e);
-        }
+      const v = cfg.views?.find((x) => x.id === t.options.viewConfig.id);
+      if (!v?.field_ids?.length) return false;
+      edit(v);
+      const host = Object.create(t, {
+        plugin: { value: Object.create(t.plugin, { getConfiguration: { value: /* @__PURE__ */ __name(() => cfg, "value") } }), writable: true },
+        columnFields: { value: /* @__PURE__ */ new Map() },
+        columnSizes: { value: /* @__PURE__ */ new Map() },
+        bustAllNodeCache: { value: /* @__PURE__ */ __name(() => {
+        }, "value") },
+        refresh: { value: /* @__PURE__ */ __name(() => {
+        }, "value") }
+      });
+      try {
+        return await t.addPropertyColumn.call(host, { id: v.field_ids[0] }, false);
+      } catch (e) {
+        console.warn("[Table Tweaks] saving the view failed:", e);
+        return false;
       }
-      if (!saved) this.ui.addToaster({ title: "Table Tweaks", message: "Couldn't save the page size; it applies until this view is reopened.", dismissible: true, autoDestroyTime: 5e3 });
+    }
+    /** "Context ↑" */
+    keyLabel(t, key) {
+      return `${t.plugin.fieldsById.get(key.field)?.label ?? key.field} ${key.dir === "desc" ? "\u2193" : "\u2191"}`;
+    }
+    /**
+     * The "Sort View by…" menu, one step at a time: the chain (pick a key to
+     * flip, move or remove it), then "Then by…" to add a column. Every change
+     * applies and saves at once, then the menu comes back until Done or Escape.
+     * @param {'main' | 'add' | 'key'} step
+     */
+    openSortMenu(t, step = "main", index = -1) {
+      if (t._destroyed) return;
+      const keys = sortKeys(t);
+      const next = /* @__PURE__ */ __name((s, i = -1) => setTimeout(() => this.openSortMenu(t, s, i)), "next");
+      const apply = /* @__PURE__ */ __name((chain) => {
+        this.setSortKeys(t, chain);
+        next("main");
+      }, "apply");
+      let options;
+      if (step === "add") {
+        const used = new Set(keys.map((k) => k.field));
+        const visible = [...t.columnFields.keys()];
+        const rank = /* @__PURE__ */ __name((f) => visible.includes(f.id) ? visible.indexOf(f.id) : visible.length, "rank");
+        options = [...t.plugin.fieldsById.values()].filter((f) => f.active !== false && !UNSORTABLE_TYPES.includes(f.type) && f.id !== OPTIONS_COL && !used.has(f.id)).sort((a, b) => rank(a) - rank(b)).flatMap((f) => ["asc", "desc"].map((dir) => ({
+          label: `${f.label}, ${dir === "asc" ? "ascending" : "descending"}`,
+          icon: dir === "asc" ? "ti-sort-ascending" : "ti-sort-descending",
+          onSelected: /* @__PURE__ */ __name(() => apply([...keys, { field: f.id, dir }]), "onSelected")
+        })));
+        options.push({ label: "Back", icon: "ti-arrow-left", onSelected: /* @__PURE__ */ __name(() => next("main"), "onSelected") });
+      } else if (step === "key" && keys[index]) {
+        const key = keys[index];
+        const move = /* @__PURE__ */ __name((to) => {
+          const chain = [...keys];
+          [chain[index], chain[to]] = [chain[to], chain[index]];
+          apply(chain);
+        }, "move");
+        options = [
+          { label: key.dir === "desc" ? "Sort ascending" : "Sort descending", icon: "ti-arrows-up-down", onSelected: /* @__PURE__ */ __name(() => apply(keys.map((k, i) => i === index ? { ...k, dir: k.dir === "desc" ? "asc" : "desc" } : k)), "onSelected") },
+          ...index > 0 ? [{ label: "Move up", icon: "ti-arrow-up", onSelected: /* @__PURE__ */ __name(() => move(index - 1), "onSelected") }] : [],
+          ...index < keys.length - 1 ? [{ label: "Move down", icon: "ti-arrow-down", onSelected: /* @__PURE__ */ __name(() => move(index + 1), "onSelected") }] : [],
+          { label: "Remove", icon: "ti-x", onSelected: /* @__PURE__ */ __name(() => apply(keys.filter((_, i) => i !== index)), "onSelected") },
+          { label: "Back", icon: "ti-arrow-left", onSelected: /* @__PURE__ */ __name(() => next("main"), "onSelected") }
+        ];
+      } else {
+        options = [
+          ...keys.map((k, i) => ({ label: `${i + 1}. ${this.keyLabel(t, k)}`, icon: "ti-arrows-sort", onSelected: /* @__PURE__ */ __name(() => next("key", i), "onSelected") })),
+          { label: keys.length ? "Then by\u2026" : "Sort by\u2026", icon: "ti-plus", onSelected: /* @__PURE__ */ __name(() => next("add"), "onSelected") },
+          ...keys.length ? [{ label: "Clear sort", icon: "ti-trash", onSelected: /* @__PURE__ */ __name(() => apply([]), "onSelected") }] : [],
+          { label: "Done", icon: "ti-check", onSelected: /* @__PURE__ */ __name(() => {
+          }, "onSelected") }
+        ];
+      }
+      this.ui.createDropdown({
+        attachedTo: t.$(".table-view-header-row") || t.node,
+        options,
+        inputPlaceholder: step === "add" ? "Column\u2026" : "Sort view by\u2026",
+        width: 280
+      });
+    }
+    /**
+     * Sort the table by `keys` now and save them: the first as the view's own
+     * sort (so the table opens sorted by it), the chain as `opts.sort`. No keys
+     * = custom order, as native's "clear sort".
+     */
+    async setSortKeys(t, keys) {
+      const first = keys[0];
+      const edit = /* @__PURE__ */ __name((v) => {
+        v.sort_field_id = first?.field ?? null;
+        v.sort_dir = first?.dir ?? "asc";
+        v.opts = { ...v.opts, sort: keys };
+        if (keys.length < 2) delete v.opts.sort;
+      }, "edit");
+      edit(t.options.viewConfig);
+      t.stableRowOrder = [];
+      t.setSortColumn(first?.field ?? "", first?.dir ?? "asc");
+      t.refresh();
+      t.toolbar?.refresh?.();
+      if (!await this.saveView(t, edit)) this.ui.addToaster({ title: "Table Tweaks", message: "Couldn't save the sort; it applies until this view is reopened.", dismissible: true, autoDestroyTime: 5e3 });
     }
   };
   return __toCommonJS(plugin_exports);

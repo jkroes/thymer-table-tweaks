@@ -52,6 +52,22 @@ Tweaks (all verified live 2026-10-25, debug Chrome, Actions' native "Thymer" vie
 - **⌥← / ⌥→ page turns** (`plugin.table_prev_page` / `plugin.table_next_page`, the same
   rebindable names table-view uses), keeping the row within the page and the column;
   status bar "97 items · Page 2 of 4" and a "⌥← ⌥→ Page" shortcut hint.
+- **Multi-column sort per view** (added 2026-10-25) — palette context option "Sort View
+  by…" opens a `this.ui.createDropdown` builder (chain / Then by… / per-key flip, move,
+  remove / Clear / Done), re-created after each pick (`setTimeout`; the SDK dropdown calls
+  `onSelected` then destroys itself). Saved via `saveView` (the `addPropertyColumn` host
+  trick) as the view's `sort_field_id`/`sort_dir` (first key) plus `opts.sort`
+  (`[{field, dir}]`, only when ≥2 keys). `sortKeys(t)` = the saved chain while
+  `t.sortColumn.fieldId` equals its first key (primary dir from the header), else native's
+  single column. Applied by wrapping `sortRows`: for the call, the table's own `plugin`
+  is swapped for an `Object.create` whose `sortByField` runs native `sortByField` once per
+  key, last to first — native `Cx` is an in-place stable `Array.sort` with ties → 0, so
+  passes compose; native `stableRowOrder` bookkeeping runs untouched. Choices sort by
+  schema order (native). `setSortKeys` clears `stableRowOrder` before `setSortColumn`
+  (which only clears it when the primary changes). Verified live 2026-10-25 (debug
+  Chrome, Actions, real CDP keys into the dropdown): build Context ↑ → Target ↑, rows
+  grouped contiguously; header flip of Context keeps Target; Target header alone sorts
+  natively; Context header restores the chain; config saved; palette label shows chain.
 
 Everything table-view adds beyond native is now here (pager select + typed size + key
 tooltips added 2026-10-25). Not ported on purpose: table-view's fix for native keeping
@@ -99,7 +115,7 @@ saves / Escape / click-away cancel), Next, native page select alongside ours.
   changes — a probe that cancelled it (to screencast native) otherwise left the header
   unpinned for good.
 - **Table class** (`hD`, only native tables use it — registered solely as "Table", no
-  subclasses): `Ot` + `handleCommandPaletteContextOption` (palette),
+  subclasses): `Ot` + `handleCommandPaletteContextOption` (palette), `sortRows` (multi-sort),
   `updateStatusBarNumberOfItems` + `Ue` (status bar; `ue()` repaints the shortcuts when
   paging starts/stops, since the page count is only known after a refresh),
   `onKeyboardNavigation` (page keys),

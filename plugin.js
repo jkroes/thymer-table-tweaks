@@ -76,7 +76,7 @@ const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 /**
  * Default page-turn keys. The app's shortcut parser accepts any `plugin.*`
  * action name, so users rebind these in Change Keyboard Shortcuts like the
- * app's own. The same names as plugins/table-view, so one binding serves both.
+ * app's own. The same names the retired plugins/table-view used, so old bindings carry over.
  */
 const DEFAULT_KEYS = {
 	'plugin.table_prev_page': 'Alt+ArrowLeft',

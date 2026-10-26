@@ -13,8 +13,9 @@ Mechanics (all repos identical): `./setup.sh` re-links `sdk/`, `bin/thymercli` a
 
 A GLOBAL plugin (`AppPlugin`) that tweaks Thymer's NATIVE table view in every collection,
 so it takes no collection's code slot. Built 2026-10-25 as the lighter alternative to
-`plugins/table-view` (a full custom-view re-implementation); both can run side by side —
-this one only touches native table components. Live as global plugin "Table Tweaks"
+`plugins/table-view` (a full custom-view re-implementation), which was retired 2026-10-25 in
+its favor and now lives in `plugins/archives/table-view`. This one only touches native table
+components. Live as global plugin "Table Tweaks"
 (created via MCP `create_collection type: global_plugin`). Deploy:
 
 ```bash
@@ -116,7 +117,7 @@ saves / Escape / click-away cancel), Next, native page select alongside ours.
   `gD`, whose node is `.custom-view`).
 - **INTERNALS** lists every borrowed name, checked once against the first table; if any is
   missing nothing is patched and a "Table Tweaks needs updating" toast names them. When
-  the code borrows a new internal, add it there. Re-decode recipe: table-view's CLAUDE.md
+  the code borrows a new internal, add it there. Re-decode recipe: `plugins/archives/table-view/CLAUDE.md`
   ("Native table, decoded").
 
 ## Open / unverified

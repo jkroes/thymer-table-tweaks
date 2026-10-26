@@ -29,9 +29,13 @@ Tweaks (all verified live 2026-10-25, debug Chrome, Actions' native "Thymer" vie
 - **Rows per page per view** — `opts.page_size` on the view config (0 = all, absent =
   native 75). Set from the command palette while the table is focused ("Show N Rows per
   Page" / "Show All Rows", the native `Ot` context-option mechanism) or from a select in
-  the pager (presets, All rows, Custom… → number field; Enter saves, Escape/blur cancel,
-  keys stay in the field). The pager's Previous / Next tooltips name the page keys. Both
-  come from an own `getPaginationNodes` on the pager: native builds fresh nodes there and
+  the pager (presets, All rows, or any number typed into the dropdown's filter field —
+  it shows as a pinned "N per page" option, Enter picks it; replaced the old Custom…
+  number field 2026-10-25). The typed entry is an `addDynamicOptions` provider added by
+  wrapping the select's dropdown `options.onPopulate` (a microtask after creation, once
+  `_refresh` has inserted the select and it has built its `Js`); `pinned` options lead
+  the results while searching. A preset number shows only the preset. The pager's Previous / Next tooltips name the page keys. Both
+  come from the patched `getPaginationNodes` on the pager: native builds fresh nodes there and
   its `_refresh` inserts them, so the additions are made before insertion and ride every
   redraw — no live Thymer node is edited, no remount observer. Where native hides the
   pager (one page / All) the bar still shows count + select above 25 rows. The select is
@@ -47,11 +51,8 @@ Tweaks (all verified live 2026-10-25, debug Chrome, Actions' native "Thymer" vie
 - **⌥← / ⌥→ page turns** (`plugin.table_prev_page` / `plugin.table_next_page`, the same
   rebindable names table-view uses), keeping the row within the page and the column;
   status bar "97 items · Page 2 of 4" and a "⌥← ⌥→ Page" shortcut hint.
-- **Pager reveal** — keyboard focus on the page's last row scrolls the pager into view.
-  Mouse focus doesn't (native sets `skipRefocus` for clicks, so `ensureFocusInView` isn't
-  called) — same as table-view.
 
-Everything table-view adds beyond native is now here (pager select + Custom… + key
+Everything table-view adds beyond native is now here (pager select + typed size + key
 tooltips added 2026-10-25). Not ported on purpose: table-view's fix for native keeping
 the old table width after Hide column. Default differs: unset = native 75 here, All there.
 
@@ -59,7 +60,7 @@ the old table width after Hide column. Default differs: unset = native 75 here, 
 (ours AND native's page select) don't open on CDP clicks even with focus/lifecycle
 emulation; bring Chrome to the front (ask the user), or dispatch the select's `change`
 CustomEvent (`detail: {value, label}`), which is what picking an option fires. With
-Chrome in front, verified 2026-10-25 with real clicks: presets, All rows, Custom… (Enter
+Chrome in front, verified 2026-10-25 with real clicks: presets, All rows, the old Custom… (Enter
 saves / Escape / click-away cancel), Next, native page select alongside ours.
 
 ## How it hooks in (bundle-decoded)
@@ -69,49 +70,54 @@ saves / Escape / click-away cancel), Next, native page select alongside ours.
   jC, 0)`. Everything else reads the pager instance (`Fh`): `nrItemsPerPage`,
   `currentPageNr`, `nrAvailablePages`. `nrItemsPerPage = 0` is native "no paging" (`z6`
   returns all, `getPaginationNodes` null, and `getCellCoords`' `d/0` page is clamped to 0
-  by `j6`). The plugin puts an OWN `setPaginationDetails` on each table's pager that swaps
-  a non-null size for the view's.
-- **Finding tables:** no SDK route. A MutationObserver on `document.body` watches for an
-  added `.table-view`, then walks the component tree (`g_focusedComponent` → `.parent` to
-  the root → `.children`) for components whose node is `.table-view` with `pagination`,
-  `focusState`, `options.viewConfig` (excludes the custom view's `gD`, whose node is
-  `.custom-view`). `hD` builds its node in `ve`'s constructor and calls `setInitView` at
-  the end of its own; the first paint is a rAF later, so the observer's microtask tweaks
-  it before anything paints.
-- **Everything else** is own-property overrides on the instance (`PATCHED`), calling the
-  prototype's method: `Ot` + `handleCommandPaletteContextOption` (palette),
+  by `j6`). The plugin wraps the pager class's `setPaginationDetails` to swap a non-null
+  size for the view's — at class level it catches `setInitView`'s 75 during construction,
+  so a new table never shows 75 rows (per-frame row count across a rebuild: 25 → 0 → 25).
+- **Class patches (since 2026-10-25, replacing per-instance overrides):** the first native
+  table found yields `Object.getPrototypeOf(table)` (`hD`) and of `table.pagination`
+  (`Fh`). `patch()` stores each original once under `Symbol.for('table-tweaks.originals')`
+  on the prototype (`{fn, own}`), so a hot reload — or a load whose predecessor never
+  unloaded — never wraps a wrapper; `restore()` puts own methods back and deletes the
+  inherited one (`updateStatusBarNumberOfItems` lives on `Hn`, shared with the custom
+  view `gD`, so it is patched as an own property of `hD.prototype` only). Every wrapper
+  falls back to native on a throw (logged once per method). Already-open tables get a
+  one-time fix-up (size, pager redraw, sticky, refresh, shortcuts) at patch time and on
+  unload. Verified live 2026-10-25 (debug Chrome, by evaluation): hot reload keeps the same
+  stored originals; reload with no table open → the first table opened comes up at its
+  saved 25 with no 75 frame (rows per frame −1 → 0 → 25); the same `page_size: 25` config
+  rendered as list / gallery (ad-hoc `setView`, unsaved) keeps their pagers at native 50
+  with no select or key tooltips; the Tasks panel's pager stays native. Desktop app (9223,
+  read-only): hot reload picked up the class patches, no leftover instance overrides.
+  Same day, real CDP input (guarded key batches, screenshots): status-bar "⌥←⌥→ Page" hint
+  and "Page N of M"; ⌥→ from row 11 lands on row 86, same column, ⌥← back, both no-ops
+  at the ends; ⌘P "rows"
+  lists the sizes minus the current one, Enter on one applies + saves (75 clears it);
+  wheel-scroll screencast with the header painted magenta: tweaked 25/25 frames pinned,
+  native jumps between pinned and ~130 CSS px into the rows.
+- The sticky animation is rebuilt when it is `idle` as well as when the header element
+  changes — a probe that cancelled it (to screencast native) otherwise left the header
+  unpinned for good.
+- **Table class** (`hD`, only native tables use it — registered solely as "Table", no
+  subclasses): `Ot` + `handleCommandPaletteContextOption` (palette),
   `updateStatusBarNumberOfItems` + `Ue` (status bar; `ue()` repaints the shortcuts when
   paging starts/stops, since the page count is only known after a refresh),
-  `onKeyboardNavigation` (page keys), `ensureFocusInView` (pager reveal),
+  `onKeyboardNavigation` (page keys),
   `applyHeaderStickiness` (pinned header: base runs, then `top` is reset to its static
-  part `30 - offset` and a WAAPI ScrollTimeline translateY adds scrollTop). onUnload
-  deletes them, restores 75, cancels the animations.
-- **INTERNALS** lists every borrowed name; a table missing any is left native and a
-  "Table Tweaks needs updating" toast names them (once per name per load). When the code
-  borrows a new internal, add it there. Re-decode recipe: table-view's CLAUDE.md
+  part `30 - offset` and a WAAPI ScrollTimeline translateY adds scrollTop).
+- **Pager class** (`Fh`): `setPaginationDetails`, `getPaginationNodes`. SHARED with the
+  tasks view and the card views (list/gallery, page 50), so both pass through unless
+  `this.parent instanceof` the table class (`ve` sets `parent` before `hD` builds its pager).
+- **Finding the classes:** no SDK route, and no route without a live table (the collection
+  plugin's `getViewTypeClass('table')` is reachable only from an open collection view, and
+  the workspace's plugin lookup `z()` is module-private). With no table open at load, a
+  MutationObserver waits for the first `.table-view`, then disconnects. Tables are found by
+  walking the component tree (`g_focusedComponent` → `.parent` to the root → `.children`)
+  for a node `.table-view` with `pagination`, `focusState`, `options.viewConfig` (excludes
+  `gD`, whose node is `.custom-view`).
+- **INTERNALS** lists every borrowed name, checked once against the first table; if any is
+  missing nothing is patched and a "Table Tweaks needs updating" toast names them. When
+  the code borrows a new internal, add it there. Re-decode recipe: table-view's CLAUDE.md
   ("Native table, decoded").
-
-## NEXT: switch from instance overrides to class patches (decided 2026-10-25)
-
-Keep ONE plugin; replace the per-table discovery (MutationObserver + tree walk + own
-properties) with patches on two classes, reached once from the first live table
-(`table.constructor.prototype`, `table.pagination.constructor.prototype`) or a collection
-component's internal `plugin.getViewTypeClass('table')`:
-- **Table class** (`hD`): `Ue`, `Ot`, `handleCommandPaletteContextOption`,
-  `updateStatusBarNumberOfItems`, `onKeyboardNavigation`, `ensureFocusInView`,
-  `applyHeaderStickiness`. Only native tables use it (bundle FX3P7QBW: registered solely
-  as view type "Table", no subclasses) — no guard needed. Methods are looked up per call,
-  so already-open tables pick the patches up; no fix-up.
-- **Pager class** (`Fh`): `setPaginationDetails` (view's size), `getPaginationNodes`
-  (picker + key tooltips). SHARED with the tasks view and the card views (list/gallery,
-  page 50), so guard on "parent is a native table" and pass through otherwise. Patching
-  `setPaginationDetails` at class level catches `setInitView`'s 75 during construction —
-  no first-paint race. Tables already open at patch time need a one-time size fix-up.
-- Safeguards for both: wrap a STORED original (private key on the prototype, so a hot
-  reload never wraps a wrapper); try/catch in every wrapper falling back to the original
-  (worst case = native behavior); onUnload restores the originals. Keep the INTERNALS
-  check, run once against the classes.
-- Still needs a one-time wait for the first table when no table is open at load.
 
 ## Open / unverified
 
@@ -129,3 +135,5 @@ component's internal `plugin.getViewTypeClass('table')`:
   holding at the panel top with its ScrollTimeline animation across scrolls. Driven by
   evaluation, not real input (the user's live app); the pixel wobble check was web-only.
 - Phone layout: all tweaks but page size skip `isPhoneTableView()` tables.
+- Removed 2026-10-25 at the user's request: the pager reveal (an `ensureFocusInView`
+  wrapper scrolling the pager into view on the page's last row).

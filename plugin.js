@@ -4,27 +4,29 @@
  * in the workspace:
  *
  * - Rows per page, per view: the view's `opts.page_size` (0 = all rows), set
- *   from a select in the pager (presets, All rows, Custom…) or the command
+ *   from a select in the pager (presets, All rows, or any number typed into
+ *   its filter field) or the command
  *   palette while the table is focused. Native hard-codes 75. The pager's
  *   Previous / Next tooltips name the page-turn keys.
  * - A pinned header that doesn't wobble while scrolling.
  * - ⌥← / ⌥→ turn the page (rebindable as `plugin.table_prev_page` /
  *   `plugin.table_next_page`), and the status bar names the page.
- * - Focusing the page's last row scrolls the pager into view too.
  *
  * None of this is SDK. The table is an app component (`hD`, a subclass of the
- * records-view base `Hn`) reached through `window.g_focusedComponent`; each
- * table instance gets own-property overrides of a few methods, deleted on
- * unload. Nothing is patched on a prototype and no Thymer node is rebuilt.
- * The names are internal and partly minified, so `INTERNALS` lists them and a
- * table missing any gets no tweaks and a toast instead.
+ * records-view base `Hn`) reached through `window.g_focusedComponent`. The
+ * first table found yields two classes, patched in place: the table class
+ * (native tables only) and its pager class (shared with other views, so those
+ * wrappers check for a table parent). Every wrapper falls back to native on a
+ * throw, and unload restores the originals. No Thymer node is rebuilt. The
+ * names are internal and partly minified, so `INTERNALS` lists them and a
+ * build missing any gets no tweaks and a toast instead.
  */
 
 /** The leading options column's field id (the bundle's `Yt`). */
 const OPTIONS_COL = ':first_col';
 
 /** Page size presets offered in the palette; 0 = all rows. 75 is native's (`jC`). */
-const PAGE_SIZES = [25, 50, 75, 100, 200, 0];
+const PAGE_SIZES = [25, 50, 75, 100, 0];
 const NATIVE_PAGE_SIZE = 75;
 
 /**
@@ -39,14 +41,35 @@ const PALETTE_ACTION = 'table-tweaks.page_size';
 /** Instance methods and fields the tweaks use; see the header comment. */
 const INTERNALS = {
 	methods: ['refresh', 'ue', '$', 'Ue', 'Ot', 'handleCommandPaletteContextOption', 'updateStatusBarNumberOfItems',
-		'applyHeaderStickiness', 'isPhoneTableView', 'ensureFocusInView', 'onKeyboardNavigation', 'startFocus',
+		'applyHeaderStickiness', 'isPhoneTableView', 'onKeyboardNavigation', 'startFocus',
 		'addPropertyColumn', 'getPeekStatusBarContext'],
 	pagination: ['setPaginationDetails', 'requestPage', 'getPaginationNodes', 'refresh']
 };
 
-/** The tweaked methods, all own properties on the table instance. */
-const PATCHED = ['Ue', 'Ot', 'handleCommandPaletteContextOption', 'updateStatusBarNumberOfItems', 'applyHeaderStickiness',
-	'ensureFocusInView', 'onKeyboardNavigation'];
+/**
+ * Where a patched prototype keeps its originals: `name → { fn, own }`. A
+ * registry symbol, so a reloaded plugin finds the originals a previous load
+ * stored and never wraps a wrapper, even if that load never unloaded.
+ */
+const ORIGINALS = Symbol.for('table-tweaks.originals');
+
+/** Replace each method with `make(original)`, the original stored once per prototype. */
+function patch(proto, wrappers) {
+	const originals = proto[ORIGINALS] ??= {};
+	for (const [name, make] of Object.entries(wrappers)) {
+		originals[name] ??= { fn: proto[name], own: Object.hasOwn(proto, name) };
+		proto[name] = make(originals[name].fn);
+	}
+}
+
+/** Undo `patch`: own methods back in place, inherited ones uncovered again. */
+function restore(proto) {
+	for (const [name, { fn, own }] of Object.entries(proto[ORIGINALS] || {})) {
+		if (own) proto[name] = fn;
+		else delete proto[name];
+	}
+	delete proto[ORIGINALS];
+}
 
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -167,7 +190,7 @@ function esc(s) {
 	return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/** A native table component: its node is the `.table-view` and it pages. */
+/** A native table component: its node is the `.table-view` and it pages. Used to find the class. */
 function isNativeTable(c) {
 	return !!(c?.node?.classList?.contains('table-view') && c.pagination && c.focusState && c.options?.viewConfig);
 }
@@ -189,7 +212,7 @@ function missingInternals(t) {
 
 /** The view's chosen page size, or `fallback` (native's) when it has none. */
 function pageSizeOf(t, fallback) {
-	const n = t.options.viewConfig.opts?.page_size;
+	const n = t.options?.viewConfig?.opts?.page_size;
 	return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
@@ -201,47 +224,88 @@ function isPaged(t) {
 export class Plugin extends AppPlugin {
 
 	onLoad() {
-		/** @type {Set<any>} every table instance currently tweaked */
-		this.tables = new Set();
 		/** @type {WeakMap<any, Animation>} each table's pinned-header scroll animation */
 		this.stickyAnims = new WeakMap();
+		/** @type {WeakMap<any, boolean>} whether each table was paging at its last status-bar update */
+		this.wasPaged = new WeakMap();
 		/** problems already reported this load, so each warns once */
 		this.reported = new Set();
+		/** the patched prototypes, once a first table has shown them */
+		this.tableProto = null;
+		this.pagerProto = null;
 
-		// A table is built whole in its constructor (the native page size is set
-		// there too, `setInitView`) and paints a frame later, so catching its
-		// node's insertion — a microtask — tweaks it before its first paint.
+		// The classes are only reachable from a live table, so with none open the
+		// plugin waits for the first one. A table is built whole in its
+		// constructor (native's page size is set there, `setInitView`) and paints
+		// a frame later, so catching its node's insertion — a microtask — fixes
+		// it up before its first paint. Tables built after the patch are right
+		// from the start.
+		if (this.findAndPatch()) return;
 		this.observer = new MutationObserver((records) => {
 			for (const r of records) {
 				for (const n of r.addedNodes) {
 					if (n.nodeType === 1 && (n.classList.contains('table-view') || n.querySelector('.table-view'))) {
-						this.scan();
+						if (this.findAndPatch()) this.observer.disconnect();
 						return;
 					}
 				}
 			}
 		});
 		this.observer.observe(document.body, { childList: true, subtree: true });
-		this.scan();
 	}
 
 	onUnload() {
 		this.observer?.disconnect();
-		for (const t of this.tables) this.untweak(t);
-		this.tables.clear();
+		if (!this.tableProto) return;
+		restore(this.tableProto);
+		restore(this.pagerProto);
+		for (const t of this.openTables()) {
+			this.stickyAnims.get(t)?.cancel();
+			t.pagination.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
+			t.pagination.refresh();
+			t.applyHeaderStickiness();
+			t.refresh();
+			t.ue();
+		}
 	}
 
-	/** Tweak every native table not tweaked yet; forget destroyed ones. */
-	scan() {
-		for (const t of this.tables) if (t._destroyed) this.tables.delete(t);
-		const root = appRoot();
-		if (!root) return;
-		const stack = [root];
+	/** Every live native table (or, before the patch, every native-looking one). */
+	openTables() {
+		const tables = [];
+		const stack = [appRoot()].filter(Boolean);
 		while (stack.length) {
 			const c = stack.pop();
-			if (isNativeTable(c) && !c._destroyed && !this.tables.has(c)) this.tweak(c);
+			if (!c._destroyed && (this.tableProto ? c instanceof this.tableProto.constructor : isNativeTable(c))) tables.push(c);
 			for (const child of c.children || []) stack.push(child);
 		}
+		return tables;
+	}
+
+	/**
+	 * Patch the table and pager classes from the first native table open, and
+	 * fix up the tables already built. True once patched, or once the plugin
+	 * has given up on this build (internals missing); false while no table is open.
+	 */
+	findAndPatch() {
+		const tables = this.openTables();
+		if (!tables.length) return false;
+		const missing = missingInternals(tables[0]);
+		if (missing.length) {
+			this.reportInternals(missing);
+			return true;
+		}
+		this.tableProto = Object.getPrototypeOf(tables[0]);
+		this.pagerProto = Object.getPrototypeOf(tables[0].pagination);
+		patch(this.tableProto, this.tableWrappers());
+		patch(this.pagerProto, this.pagerWrappers());
+		for (const t of tables) {
+			t.pagination.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
+			t.pagination.refresh();
+			t.applyHeaderStickiness();
+			t.refresh();
+			t.ue();
+		}
+		return true;
 	}
 
 	/**
@@ -260,161 +324,156 @@ export class Plugin extends AppPlugin {
 		});
 	}
 
-	tweak(t) {
-		const missing = missingInternals(t);
-		if (missing.length) {
-			this.reportInternals(missing);
-			return;
-		}
-		this.tables.add(t);
-		const plugin = this;
-		const base = Object.getPrototypeOf(t);
-		const pager = t.pagination;
-		const pagerBase = Object.getPrototypeOf(pager).setPaginationDetails;
-
-		// --- rows per page ------------------------------------------------------
-		// Native passes its constant (`jC`) here once, in `setInitView`; every
-		// other caller passes null for the size. The view's own size wins.
-		pager.setPaginationDetails = function (n, size, page) {
-			return pagerBase.call(this, n, size === null ? null : pageSizeOf(t, size), page);
-		};
-		pager.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
-
-		// The pager redraws from `getPaginationNodes` (fresh nodes, inserted by
-		// its `_refresh`), so the size select and key tooltips are added to
-		// those nodes before Thymer inserts them — nothing already on the page
-		// is touched, and every redraw carries them.
-		const pagerNodesBase = Object.getPrototypeOf(pager).getPaginationNodes;
-		pager.getPaginationNodes = function () {
-			return plugin.pagerNodes(t, pagerNodesBase.call(this));
-		};
-		pager.refresh();
-
-		t.Ot = function (palette) {
-			base.Ot.call(this, palette);
-			const current = this.pagination.nrItemsPerPage;
-			palette.addStaticOptions(PAGE_SIZES.filter(n => n !== current).map(n => ({
-				value: PALETTE_ACTION,
-				label: n ? `Show ${n} Rows per Page` : 'Show All Rows',
-				icon: 'ti-list-numbers',
-				json: { size: n }
-			})));
-		};
-		t.handleCommandPaletteContextOption = function (palette, option, ...rest) {
-			if (option.value === PALETTE_ACTION && Number.isInteger(option.json?.size)) {
-				plugin.setPageSize(this, option.json.size);
-				return true;
-			}
-			return base.handleCommandPaletteContextOption.call(this, palette, option, ...rest);
-		};
-
-		// --- page indicator + page-turn keys ------------------------------------
-		// The pager sits below the rows, often off screen while the keyboard turns
-		// pages, so the status bar's item count names the page too. Forgetting the
-		// cached count makes the next view's count repaint the label. The page
-		// count is only known after a refresh, while the shortcuts (`Ue`) paint
-		// on focus, so they repaint whenever the table starts or stops paging.
-		let wasPaged = false;
-		t.updateStatusBarNumberOfItems = function (n = null) {
-			base.updateStatusBarNumberOfItems.call(this, n);
-			if (isPaged(this) !== wasPaged) {
-				wasPaged = !wasPaged;
-				if (window.g_focusedComponent === this) this.ue();
-			}
-			const label = this.statusBar?.lineStatusItem;
-			if (!isPaged(this) || typeof label?.setLabel !== 'function' || this._?.()?.panelHasFocusState?.() === false) return;
-			label.setLabel(`${(n ?? this.cachedAllItems?.size ?? 0).toLocaleString()} items · Page ${this.pagination.currentPageNr + 1} of ${this.pagination.nrAvailablePages}`);
-			this.statusBar.prevNrItems = null;
-		};
-		t.Ue = function () {
-			const context = base.Ue.call(this);
-			if (!context?.skipDefaultShortcuts || !isPaged(this) || this.getPeekStatusBarContext()) return context;
-			const keys = pageKeys();
-			const bound = [keys['plugin.table_prev_page'], keys['plugin.table_next_page']].filter(Boolean);
-			if (bound.length) context.shortcuts.push({ kbd: bound.map(kbdLabel).join(' '), command: 'Page', extraClass: 'statusbar--kbd-modifier' });
-			return context;
-		};
-		t.onKeyboardNavigation = function (e) {
-			if (!this.focusState.isEditing && !this.inMoveMode) {
-				const k = keyName(e);
-				const keys = pageKeys();
-				if (k && (k === keys['plugin.table_prev_page'] || k === keys['plugin.table_next_page'])) {
-					if (plugin.turnPage(this, k === keys['plugin.table_next_page'] ? 1 : -1)) e.preventDefault();
-					return;
-				}
-			}
-			return base.onKeyboardNavigation.call(this, e);
-		};
-
-		// --- pager reveal --------------------------------------------------------
-		// Not native: on the page's last row, scroll the pager below it into view
-		// too, so its "Showing a–b of n" is on screen before the next page.
-		// Native's rule alone leaves it hidden whenever that row was already in
-		// view. The row still keeps native's 80px top clearance.
-		t.ensureFocusInView = function () {
-			base.ensureFocusInView.call(this);
-			const row = this.focusState.row;
-			const scroller = this.verticalScrollNode;
-			const $pager = this.pagination.node;
-			if (!row || !scroller || !isPaged(this) || !$pager?.isConnected || this.cachedRowItemsInView.at(-1)?.guid !== row.guid) return;
-			const cell = this.$(`.table-view-row[data-guid="${CSS.escape(row.guid)}"]`);
-			if (!cell) return;
-			const v = scroller.getBoundingClientRect();
-			const top = scroller.scrollTop;
-			const showsPager = top + $pager.getBoundingClientRect().bottom - v.bottom;
-			const clearsTop = top + cell.getBoundingClientRect().top - v.top - 80;
-			const to = Math.min(Math.max(top, showsPager), clearsTop);
-			if (Math.abs(to - top) >= 1) scroller.scrollTo({ top: to, behavior: Math.abs(to - top) > 500 ? 'auto' : 'smooth' });
-		};
-
-		// --- pinned header ---------------------------------------------------------
-		// Native rewrites the pinned header's `top` (scrollTop - offset + 30) on
-		// every scroll event, which lands a frame after the compositor has
-		// scrolled: the header rides along for that frame and snaps back. Here
-		// `top` keeps only the static part and a ScrollTimeline translateY adds
-		// scrollTop, which the compositor applies in the same frame (a WAAPI
-		// animation, so the app's reduced-motion `animation: none` rule doesn't
-		// cancel it). Its range runs 1:1 in px, see STICKY_RANGE.
-		t.applyHeaderStickiness = function () {
-			base.applyHeaderStickiness.call(this);
-			if (this.isPhoneTableView() || typeof ScrollTimeline !== 'function') return;
-			const $header = this.$('.table-view-header-row');
-			const scroller = this.verticalScrollNode;
-			let anim = plugin.stickyAnims.get(this);
-			if (!$header || !scroller || !this.headerInStickyMode) {
-				anim?.cancel();
-				plugin.stickyAnims.delete(this);
-				return;
-			}
-			const offset = this.node.getBoundingClientRect().y + scroller.scrollTop - scroller.getBoundingClientRect().y;
-			$header.style.top = `${30 - offset}px`;
-			if (anim?.effect?.target !== $header) {
-				anim?.cancel();
-				anim = $header.animate(
-					[{ transform: 'translateY(0px)' }, { transform: `translateY(${STICKY_RANGE}px)` }],
-					{ timeline: new ScrollTimeline({ source: scroller, axis: 'block' }), rangeStart: '0px', rangeEnd: `${STICKY_RANGE}px`, fill: 'both', easing: 'linear' }
-				);
-				plugin.stickyAnims.set(this, anim);
-			}
-		};
-
-		t.applyHeaderStickiness();
-		t.refresh();
-		t.ue();
+	/** A tweak threw: logged once per method, and that call falls back to native. */
+	reportError(name, e) {
+		if (this.reported.has(name)) return;
+		this.reported.add(name);
+		console.warn(`[Table Tweaks] ${name} failed, native behavior kept:`, e);
 	}
 
-	untweak(t) {
-		for (const name of PATCHED) delete t[name];
-		delete t.pagination.setPaginationDetails;
-		delete t.pagination.getPaginationNodes;
-		this.stickyAnims.get(t)?.cancel();
-		this.stickyAnims.delete(t);
-		if (t._destroyed) return;
-		t.pagination.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
-		t.pagination.refresh();
-		t.applyHeaderStickiness();
-		t.refresh();
-		t.ue();
+	/**
+	 * The pager class is shared with the tasks and card views, so both wrappers
+	 * pass through unless the pager belongs to a native table.
+	 */
+	pagerWrappers() {
+		const plugin = this;
+		const Table = this.tableProto.constructor;
+		return {
+			// --- rows per page ----------------------------------------------------
+			// Native passes its constant (`jC`) here once, in `setInitView`; every
+			// other caller passes null for the size. The view's own size wins.
+			setPaginationDetails: (orig) => function (n, size, page) {
+				if (size !== null && this.parent instanceof Table) {
+					try {
+						size = pageSizeOf(this.parent, size);
+					} catch (e) {
+						plugin.reportError('setPaginationDetails', e);
+					}
+				}
+				return orig.call(this, n, size, page);
+			},
+			// The pager redraws from `getPaginationNodes` (fresh nodes, inserted by
+			// its `_refresh`), so the size select and key tooltips are added to
+			// those nodes before Thymer inserts them — nothing already on the page
+			// is touched, and every redraw carries them.
+			getPaginationNodes: (orig) => function () {
+				const nodes = orig.call(this);
+				if (!(this.parent instanceof Table)) return nodes;
+				try {
+					return plugin.pagerNodes(this.parent, nodes);
+				} catch (e) {
+					plugin.reportError('getPaginationNodes', e);
+					return orig.call(this);
+				}
+			}
+		};
+	}
+
+	/** Only native tables use the table class (registered once, as "Table"; no subclasses). */
+	tableWrappers() {
+		const plugin = this;
+		/** Native first, then `extra`; a throw in `extra` is reported and the native result stands. */
+		const after = (name, extra) => (orig) => function (...args) {
+			const result = orig.apply(this, args);
+			try {
+				extra.call(this, result, ...args);
+			} catch (e) {
+				plugin.reportError(name, e);
+			}
+			return result;
+		};
+		/** `own` handles the call when it returns true; otherwise, or on a throw, native does. */
+		const before = (name, own, handled = true) => (orig) => function (...args) {
+			try {
+				if (own.apply(this, args)) return handled;
+			} catch (e) {
+				plugin.reportError(name, e);
+			}
+			return orig.apply(this, args);
+		};
+
+		return {
+			Ot: after('Ot', function (_result, palette) {
+				const current = this.pagination.nrItemsPerPage;
+				palette.addStaticOptions(PAGE_SIZES.filter(n => n !== current).map(n => ({
+					value: PALETTE_ACTION,
+					label: n ? `Show ${n} Rows per Page` : 'Show All Rows',
+					icon: 'ti-list-numbers',
+					json: { size: n }
+				})));
+			}),
+			handleCommandPaletteContextOption: before('handleCommandPaletteContextOption', function (palette, option) {
+				if (option.value !== PALETTE_ACTION || !Number.isInteger(option.json?.size)) return false;
+				plugin.setPageSize(this, option.json.size);
+				return true;
+			}),
+
+			// --- page indicator + page-turn keys ----------------------------------
+			// The pager sits below the rows, often off screen while the keyboard
+			// turns pages, so the status bar's item count names the page too.
+			// Forgetting the cached count makes the next view's count repaint the
+			// label. The page count is only known after a refresh, while the
+			// shortcuts (`Ue`) paint on focus, so they repaint whenever the table
+			// starts or stops paging.
+			updateStatusBarNumberOfItems: after('updateStatusBarNumberOfItems', function (_result, n = null) {
+				const paged = isPaged(this);
+				if (paged !== (plugin.wasPaged.get(this) ?? false)) {
+					plugin.wasPaged.set(this, paged);
+					if (window.g_focusedComponent === this) this.ue();
+				}
+				const label = this.statusBar?.lineStatusItem;
+				if (!paged || typeof label?.setLabel !== 'function' || this._?.()?.panelHasFocusState?.() === false) return;
+				label.setLabel(`${(n ?? this.cachedAllItems?.size ?? 0).toLocaleString()} items · Page ${this.pagination.currentPageNr + 1} of ${this.pagination.nrAvailablePages}`);
+				this.statusBar.prevNrItems = null;
+			}),
+			Ue: after('Ue', function (context) {
+				if (!context?.skipDefaultShortcuts || !isPaged(this) || this.getPeekStatusBarContext()) return;
+				const keys = pageKeys();
+				const bound = [keys['plugin.table_prev_page'], keys['plugin.table_next_page']].filter(Boolean);
+				if (bound.length) context.shortcuts.push({ kbd: bound.map(kbdLabel).join(' '), command: 'Page', extraClass: 'statusbar--kbd-modifier' });
+			}),
+			// A page key is swallowed even at either end. Native returns nothing here.
+			onKeyboardNavigation: before('onKeyboardNavigation', function (e) {
+				if (this.focusState.isEditing || this.inMoveMode) return false;
+				const k = keyName(e);
+				const keys = pageKeys();
+				if (!k || (k !== keys['plugin.table_prev_page'] && k !== keys['plugin.table_next_page'])) return false;
+				if (plugin.turnPage(this, k === keys['plugin.table_next_page'] ? 1 : -1)) e.preventDefault();
+				return true;
+			}, undefined),
+
+			// --- pinned header -------------------------------------------------------
+			// Native rewrites the pinned header's `top` (scrollTop - offset + 30) on
+			// every scroll event, which lands a frame after the compositor has
+			// scrolled: the header rides along for that frame and snaps back. Here
+			// `top` keeps only the static part and a ScrollTimeline translateY adds
+			// scrollTop, which the compositor applies in the same frame (a WAAPI
+			// animation, so the app's reduced-motion `animation: none` rule doesn't
+			// cancel it). Its range runs 1:1 in px, see STICKY_RANGE.
+			applyHeaderStickiness: after('applyHeaderStickiness', function () {
+				if (this.isPhoneTableView() || typeof ScrollTimeline !== 'function') return;
+				const $header = this.$('.table-view-header-row');
+				const scroller = this.verticalScrollNode;
+				let anim = plugin.stickyAnims.get(this);
+				if (!$header || !scroller || !this.headerInStickyMode) {
+					anim?.cancel();
+					plugin.stickyAnims.delete(this);
+					return;
+				}
+				const offset = this.node.getBoundingClientRect().y + scroller.scrollTop - scroller.getBoundingClientRect().y;
+				$header.style.top = `${30 - offset}px`;
+				// A new header node needs a new animation; so does a cancelled one
+				// (`idle`), or the header would stay unpinned on this same node.
+				if (anim?.effect?.target !== $header || anim.playState === 'idle') {
+					anim?.cancel();
+					anim = $header.animate(
+						[{ transform: 'translateY(0px)' }, { transform: `translateY(${STICKY_RANGE}px)` }],
+						{ timeline: new ScrollTimeline({ source: scroller, axis: 'block' }), rangeStart: '0px', rangeEnd: `${STICKY_RANGE}px`, fill: 'both', easing: 'linear' }
+					);
+					plugin.stickyAnims.set(this, anim);
+				}
+			})
+		};
 	}
 
 	/**
@@ -440,18 +499,31 @@ export class Plugin extends AppPlugin {
 		if (!controls) return nodes;
 
 		const sizes = [...new Set([...presets, ...(size ? [size] : [])])].sort((a, b) => a - b);
-		const select = el(`<dropdown-select class='pagination-size-select button-small button-minimal button-minimal-hover' placeholder='Page size'>
+		const select = el(`<dropdown-select class='pagination-size-select button-small button-minimal button-minimal-hover' placeholder='Type any number of rows'>
 				${sizes.map(n => `<dropdown-option data-value='${n}' ${n === size ? 'selected' : ''}>${n} per page</dropdown-option>`).join('')}
 				<dropdown-option data-value='0' ${size ? '' : 'selected'}>All rows</dropdown-option>
-				<dropdown-option data-divider></dropdown-option>
-				<dropdown-option data-value='custom'>Custom…</dropdown-option>
 			</dropdown-select>`);
 		// Its `change` doesn't bubble.
-		select.addEventListener('change', (/** @type {any} */ e) => {
-			if (e.detail.value === 'custom') this.customPageSize(t, select);
-			else this.setPageSize(t, Number(e.detail.value));
-		});
+		select.addEventListener('change', (/** @type {any} */ e) => this.setPageSize(t, Number(e.detail.value)));
 		controls.prepend(select);
+		// A number typed into the dropdown's filter field becomes a pinned "N per
+		// page" option at the top, so Enter picks it and `change` saves it like a
+		// preset. The select builds its dropdown component (`Js`) once it is
+		// inserted, which `_refresh` does right after this returns; each opening
+		// populates a fresh autocomplete through `onPopulate`, whose
+		// `addDynamicOptions` providers run on every keystroke.
+		queueMicrotask(() => {
+			const options = /** @type {any} */ (select).dropdown?.options;
+			if (typeof options?.onPopulate !== 'function') return;
+			const populate = options.onPopulate;
+			options.onPopulate = (/** @type {any} */ ac) => {
+				ac.addDynamicOptions?.((/** @type {string} */ query) => {
+					const n = /^\s*\d+\s*$/.test(query) ? Number(query) : 0;
+					return n > 0 && !sizes.includes(n) ? [{ label: `${n} per page`, value: String(n), pinned: true }] : [];
+				});
+				return populate(ac);
+			};
+		});
 
 		const keys = pageKeys();
 		for (const [cls, label, action] of [['pagination-prev', 'Previous page', 'plugin.table_prev_page'], ['pagination-next', 'Next page', 'plugin.table_next_page']]) {
@@ -462,25 +534,6 @@ export class Plugin extends AppPlugin {
 			button.setAttribute('data-tooltip-html', `${esc(label)} <span class='kbd kbd-subtle'>${kbdLabel(keys[action])}</span>`);
 		}
 		return [bar];
-	}
-
-	/** "Custom…": a number field in place of the size select; Enter saves, Escape or leaving it cancels. */
-	customPageSize(t, select) {
-		const input = /** @type {HTMLInputElement} */ (el(`<input type='number' min='1' step='1' class='pagination-size-input' placeholder='Rows per page' style='width: 110px'>`));
-		if (t.pagination.nrItemsPerPage) input.value = String(t.pagination.nrItemsPerPage);
-		const cancel = () => t.pagination.refresh();
-		input.addEventListener('keydown', (e) => {
-			e.stopPropagation();
-			if (e.key === 'Escape') cancel();
-			if (e.key !== 'Enter') return;
-			const n = Number(input.value);
-			if (Number.isInteger(n) && n > 0) this.setPageSize(t, n);
-		});
-		input.addEventListener('blur', () => { if (input.isConnected) cancel(); });
-		select.dropdown?.destroy?.();
-		select.replaceWith(input);
-		input.focus();
-		input.select();
 	}
 
 	/**

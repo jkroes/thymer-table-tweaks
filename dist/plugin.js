@@ -24,7 +24,7 @@ var plugins = (() => {
   __export(plugin_exports, {
     Plugin: () => Plugin
   });
-  var PAGE_SIZES = [25, 50, 75, 100, 200, 0];
+  var PAGE_SIZES = [25, 50, 75, 100, 0];
   var NATIVE_PAGE_SIZE = 75;
   var STICKY_RANGE = 1e6;
   var PALETTE_ACTION = "table-tweaks.page_size";
@@ -39,7 +39,6 @@ var plugins = (() => {
       "updateStatusBarNumberOfItems",
       "applyHeaderStickiness",
       "isPhoneTableView",
-      "ensureFocusInView",
       "onKeyboardNavigation",
       "startFocus",
       "addPropertyColumn",
@@ -47,15 +46,23 @@ var plugins = (() => {
     ],
     pagination: ["setPaginationDetails", "requestPage", "getPaginationNodes", "refresh"]
   };
-  var PATCHED = [
-    "Ue",
-    "Ot",
-    "handleCommandPaletteContextOption",
-    "updateStatusBarNumberOfItems",
-    "applyHeaderStickiness",
-    "ensureFocusInView",
-    "onKeyboardNavigation"
-  ];
+  var ORIGINALS = Symbol.for("table-tweaks.originals");
+  function patch(proto, wrappers) {
+    const originals = proto[ORIGINALS] ??= {};
+    for (const [name, make] of Object.entries(wrappers)) {
+      originals[name] ??= { fn: proto[name], own: Object.hasOwn(proto, name) };
+      proto[name] = make(originals[name].fn);
+    }
+  }
+  __name(patch, "patch");
+  function restore(proto) {
+    for (const [name, { fn, own }] of Object.entries(proto[ORIGINALS] || {})) {
+      if (own) proto[name] = fn;
+      else delete proto[name];
+    }
+    delete proto[ORIGINALS];
+  }
+  __name(restore, "restore");
   var IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
   var DEFAULT_KEYS = {
     "plugin.table_prev_page": "Alt+ArrowLeft",
@@ -231,7 +238,7 @@ var plugins = (() => {
   }
   __name(missingInternals, "missingInternals");
   function pageSizeOf(t, fallback) {
-    const n = t.options.viewConfig.opts?.page_size;
+    const n = t.options?.viewConfig?.opts?.page_size;
     return Number.isInteger(n) && n >= 0 ? n : fallback;
   }
   __name(pageSizeOf, "pageSizeOf");
@@ -244,38 +251,74 @@ var plugins = (() => {
       __name(this, "Plugin");
     }
     onLoad() {
-      this.tables = /* @__PURE__ */ new Set();
       this.stickyAnims = /* @__PURE__ */ new WeakMap();
+      this.wasPaged = /* @__PURE__ */ new WeakMap();
       this.reported = /* @__PURE__ */ new Set();
+      this.tableProto = null;
+      this.pagerProto = null;
+      if (this.findAndPatch()) return;
       this.observer = new MutationObserver((records) => {
         for (const r of records) {
           for (const n of r.addedNodes) {
             if (n.nodeType === 1 && (n.classList.contains("table-view") || n.querySelector(".table-view"))) {
-              this.scan();
+              if (this.findAndPatch()) this.observer.disconnect();
               return;
             }
           }
         }
       });
       this.observer.observe(document.body, { childList: true, subtree: true });
-      this.scan();
     }
     onUnload() {
       this.observer?.disconnect();
-      for (const t of this.tables) this.untweak(t);
-      this.tables.clear();
+      if (!this.tableProto) return;
+      restore(this.tableProto);
+      restore(this.pagerProto);
+      for (const t of this.openTables()) {
+        this.stickyAnims.get(t)?.cancel();
+        t.pagination.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
+        t.pagination.refresh();
+        t.applyHeaderStickiness();
+        t.refresh();
+        t.ue();
+      }
     }
-    /** Tweak every native table not tweaked yet; forget destroyed ones. */
-    scan() {
-      for (const t of this.tables) if (t._destroyed) this.tables.delete(t);
-      const root = appRoot();
-      if (!root) return;
-      const stack = [root];
+    /** Every live native table (or, before the patch, every native-looking one). */
+    openTables() {
+      const tables = [];
+      const stack = [appRoot()].filter(Boolean);
       while (stack.length) {
         const c = stack.pop();
-        if (isNativeTable(c) && !c._destroyed && !this.tables.has(c)) this.tweak(c);
+        if (!c._destroyed && (this.tableProto ? c instanceof this.tableProto.constructor : isNativeTable(c))) tables.push(c);
         for (const child of c.children || []) stack.push(child);
       }
+      return tables;
+    }
+    /**
+     * Patch the table and pager classes from the first native table open, and
+     * fix up the tables already built. True once patched, or once the plugin
+     * has given up on this build (internals missing); false while no table is open.
+     */
+    findAndPatch() {
+      const tables = this.openTables();
+      if (!tables.length) return false;
+      const missing = missingInternals(tables[0]);
+      if (missing.length) {
+        this.reportInternals(missing);
+        return true;
+      }
+      this.tableProto = Object.getPrototypeOf(tables[0]);
+      this.pagerProto = Object.getPrototypeOf(tables[0].pagination);
+      patch(this.tableProto, this.tableWrappers());
+      patch(this.pagerProto, this.pagerWrappers());
+      for (const t of tables) {
+        t.pagination.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
+        t.pagination.refresh();
+        t.applyHeaderStickiness();
+        t.refresh();
+        t.ue();
+      }
+      return true;
     }
     /**
      * A Thymer update changed what the plugin relies on: the table stays native,
@@ -292,127 +335,147 @@ var plugins = (() => {
         dismissible: true
       });
     }
-    tweak(t) {
-      const missing = missingInternals(t);
-      if (missing.length) {
-        this.reportInternals(missing);
-        return;
-      }
-      this.tables.add(t);
+    /** A tweak threw: logged once per method, and that call falls back to native. */
+    reportError(name, e) {
+      if (this.reported.has(name)) return;
+      this.reported.add(name);
+      console.warn(`[Table Tweaks] ${name} failed, native behavior kept:`, e);
+    }
+    /**
+     * The pager class is shared with the tasks and card views, so both wrappers
+     * pass through unless the pager belongs to a native table.
+     */
+    pagerWrappers() {
       const plugin = this;
-      const base = Object.getPrototypeOf(t);
-      const pager = t.pagination;
-      const pagerBase = Object.getPrototypeOf(pager).setPaginationDetails;
-      pager.setPaginationDetails = function(n, size, page) {
-        return pagerBase.call(this, n, size === null ? null : pageSizeOf(t, size), page);
+      const Table = this.tableProto.constructor;
+      return {
+        // --- rows per page ----------------------------------------------------
+        // Native passes its constant (`jC`) here once, in `setInitView`; every
+        // other caller passes null for the size. The view's own size wins.
+        setPaginationDetails: /* @__PURE__ */ __name((orig) => function(n, size, page) {
+          if (size !== null && this.parent instanceof Table) {
+            try {
+              size = pageSizeOf(this.parent, size);
+            } catch (e) {
+              plugin.reportError("setPaginationDetails", e);
+            }
+          }
+          return orig.call(this, n, size, page);
+        }, "setPaginationDetails"),
+        // The pager redraws from `getPaginationNodes` (fresh nodes, inserted by
+        // its `_refresh`), so the size select and key tooltips are added to
+        // those nodes before Thymer inserts them — nothing already on the page
+        // is touched, and every redraw carries them.
+        getPaginationNodes: /* @__PURE__ */ __name((orig) => function() {
+          const nodes = orig.call(this);
+          if (!(this.parent instanceof Table)) return nodes;
+          try {
+            return plugin.pagerNodes(this.parent, nodes);
+          } catch (e) {
+            plugin.reportError("getPaginationNodes", e);
+            return orig.call(this);
+          }
+        }, "getPaginationNodes")
       };
-      pager.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
-      const pagerNodesBase = Object.getPrototypeOf(pager).getPaginationNodes;
-      pager.getPaginationNodes = function() {
-        return plugin.pagerNodes(t, pagerNodesBase.call(this));
-      };
-      pager.refresh();
-      t.Ot = function(palette) {
-        base.Ot.call(this, palette);
-        const current = this.pagination.nrItemsPerPage;
-        palette.addStaticOptions(PAGE_SIZES.filter((n) => n !== current).map((n) => ({
-          value: PALETTE_ACTION,
-          label: n ? `Show ${n} Rows per Page` : "Show All Rows",
-          icon: "ti-list-numbers",
-          json: { size: n }
-        })));
-      };
-      t.handleCommandPaletteContextOption = function(palette, option, ...rest) {
-        if (option.value === PALETTE_ACTION && Number.isInteger(option.json?.size)) {
+    }
+    /** Only native tables use the table class (registered once, as "Table"; no subclasses). */
+    tableWrappers() {
+      const plugin = this;
+      const after = /* @__PURE__ */ __name((name, extra) => (orig) => function(...args) {
+        const result = orig.apply(this, args);
+        try {
+          extra.call(this, result, ...args);
+        } catch (e) {
+          plugin.reportError(name, e);
+        }
+        return result;
+      }, "after");
+      const before = /* @__PURE__ */ __name((name, own, handled = true) => (orig) => function(...args) {
+        try {
+          if (own.apply(this, args)) return handled;
+        } catch (e) {
+          plugin.reportError(name, e);
+        }
+        return orig.apply(this, args);
+      }, "before");
+      return {
+        Ot: after("Ot", function(_result, palette) {
+          const current = this.pagination.nrItemsPerPage;
+          palette.addStaticOptions(PAGE_SIZES.filter((n) => n !== current).map((n) => ({
+            value: PALETTE_ACTION,
+            label: n ? `Show ${n} Rows per Page` : "Show All Rows",
+            icon: "ti-list-numbers",
+            json: { size: n }
+          })));
+        }),
+        handleCommandPaletteContextOption: before("handleCommandPaletteContextOption", function(palette, option) {
+          if (option.value !== PALETTE_ACTION || !Number.isInteger(option.json?.size)) return false;
           plugin.setPageSize(this, option.json.size);
           return true;
-        }
-        return base.handleCommandPaletteContextOption.call(this, palette, option, ...rest);
-      };
-      let wasPaged = false;
-      t.updateStatusBarNumberOfItems = function(n = null) {
-        base.updateStatusBarNumberOfItems.call(this, n);
-        if (isPaged(this) !== wasPaged) {
-          wasPaged = !wasPaged;
-          if (window.g_focusedComponent === this) this.ue();
-        }
-        const label = this.statusBar?.lineStatusItem;
-        if (!isPaged(this) || typeof label?.setLabel !== "function" || this._?.()?.panelHasFocusState?.() === false) return;
-        label.setLabel(`${(n ?? this.cachedAllItems?.size ?? 0).toLocaleString()} items \xB7 Page ${this.pagination.currentPageNr + 1} of ${this.pagination.nrAvailablePages}`);
-        this.statusBar.prevNrItems = null;
-      };
-      t.Ue = function() {
-        const context = base.Ue.call(this);
-        if (!context?.skipDefaultShortcuts || !isPaged(this) || this.getPeekStatusBarContext()) return context;
-        const keys = pageKeys();
-        const bound = [keys["plugin.table_prev_page"], keys["plugin.table_next_page"]].filter(Boolean);
-        if (bound.length) context.shortcuts.push({ kbd: bound.map(kbdLabel).join(" "), command: "Page", extraClass: "statusbar--kbd-modifier" });
-        return context;
-      };
-      t.onKeyboardNavigation = function(e) {
-        if (!this.focusState.isEditing && !this.inMoveMode) {
+        }),
+        // --- page indicator + page-turn keys ----------------------------------
+        // The pager sits below the rows, often off screen while the keyboard
+        // turns pages, so the status bar's item count names the page too.
+        // Forgetting the cached count makes the next view's count repaint the
+        // label. The page count is only known after a refresh, while the
+        // shortcuts (`Ue`) paint on focus, so they repaint whenever the table
+        // starts or stops paging.
+        updateStatusBarNumberOfItems: after("updateStatusBarNumberOfItems", function(_result, n = null) {
+          const paged = isPaged(this);
+          if (paged !== (plugin.wasPaged.get(this) ?? false)) {
+            plugin.wasPaged.set(this, paged);
+            if (window.g_focusedComponent === this) this.ue();
+          }
+          const label = this.statusBar?.lineStatusItem;
+          if (!paged || typeof label?.setLabel !== "function" || this._?.()?.panelHasFocusState?.() === false) return;
+          label.setLabel(`${(n ?? this.cachedAllItems?.size ?? 0).toLocaleString()} items \xB7 Page ${this.pagination.currentPageNr + 1} of ${this.pagination.nrAvailablePages}`);
+          this.statusBar.prevNrItems = null;
+        }),
+        Ue: after("Ue", function(context) {
+          if (!context?.skipDefaultShortcuts || !isPaged(this) || this.getPeekStatusBarContext()) return;
+          const keys = pageKeys();
+          const bound = [keys["plugin.table_prev_page"], keys["plugin.table_next_page"]].filter(Boolean);
+          if (bound.length) context.shortcuts.push({ kbd: bound.map(kbdLabel).join(" "), command: "Page", extraClass: "statusbar--kbd-modifier" });
+        }),
+        // A page key is swallowed even at either end. Native returns nothing here.
+        onKeyboardNavigation: before("onKeyboardNavigation", function(e) {
+          if (this.focusState.isEditing || this.inMoveMode) return false;
           const k = keyName(e);
           const keys = pageKeys();
-          if (k && (k === keys["plugin.table_prev_page"] || k === keys["plugin.table_next_page"])) {
-            if (plugin.turnPage(this, k === keys["plugin.table_next_page"] ? 1 : -1)) e.preventDefault();
+          if (!k || k !== keys["plugin.table_prev_page"] && k !== keys["plugin.table_next_page"]) return false;
+          if (plugin.turnPage(this, k === keys["plugin.table_next_page"] ? 1 : -1)) e.preventDefault();
+          return true;
+        }, void 0),
+        // --- pinned header -------------------------------------------------------
+        // Native rewrites the pinned header's `top` (scrollTop - offset + 30) on
+        // every scroll event, which lands a frame after the compositor has
+        // scrolled: the header rides along for that frame and snaps back. Here
+        // `top` keeps only the static part and a ScrollTimeline translateY adds
+        // scrollTop, which the compositor applies in the same frame (a WAAPI
+        // animation, so the app's reduced-motion `animation: none` rule doesn't
+        // cancel it). Its range runs 1:1 in px, see STICKY_RANGE.
+        applyHeaderStickiness: after("applyHeaderStickiness", function() {
+          if (this.isPhoneTableView() || typeof ScrollTimeline !== "function") return;
+          const $header = this.$(".table-view-header-row");
+          const scroller = this.verticalScrollNode;
+          let anim = plugin.stickyAnims.get(this);
+          if (!$header || !scroller || !this.headerInStickyMode) {
+            anim?.cancel();
+            plugin.stickyAnims.delete(this);
             return;
           }
-        }
-        return base.onKeyboardNavigation.call(this, e);
+          const offset = this.node.getBoundingClientRect().y + scroller.scrollTop - scroller.getBoundingClientRect().y;
+          $header.style.top = `${30 - offset}px`;
+          if (anim?.effect?.target !== $header || anim.playState === "idle") {
+            anim?.cancel();
+            anim = $header.animate(
+              [{ transform: "translateY(0px)" }, { transform: `translateY(${STICKY_RANGE}px)` }],
+              { timeline: new ScrollTimeline({ source: scroller, axis: "block" }), rangeStart: "0px", rangeEnd: `${STICKY_RANGE}px`, fill: "both", easing: "linear" }
+            );
+            plugin.stickyAnims.set(this, anim);
+          }
+        })
       };
-      t.ensureFocusInView = function() {
-        base.ensureFocusInView.call(this);
-        const row = this.focusState.row;
-        const scroller = this.verticalScrollNode;
-        const $pager = this.pagination.node;
-        if (!row || !scroller || !isPaged(this) || !$pager?.isConnected || this.cachedRowItemsInView.at(-1)?.guid !== row.guid) return;
-        const cell = this.$(`.table-view-row[data-guid="${CSS.escape(row.guid)}"]`);
-        if (!cell) return;
-        const v = scroller.getBoundingClientRect();
-        const top = scroller.scrollTop;
-        const showsPager = top + $pager.getBoundingClientRect().bottom - v.bottom;
-        const clearsTop = top + cell.getBoundingClientRect().top - v.top - 80;
-        const to = Math.min(Math.max(top, showsPager), clearsTop);
-        if (Math.abs(to - top) >= 1) scroller.scrollTo({ top: to, behavior: Math.abs(to - top) > 500 ? "auto" : "smooth" });
-      };
-      t.applyHeaderStickiness = function() {
-        base.applyHeaderStickiness.call(this);
-        if (this.isPhoneTableView() || typeof ScrollTimeline !== "function") return;
-        const $header = this.$(".table-view-header-row");
-        const scroller = this.verticalScrollNode;
-        let anim = plugin.stickyAnims.get(this);
-        if (!$header || !scroller || !this.headerInStickyMode) {
-          anim?.cancel();
-          plugin.stickyAnims.delete(this);
-          return;
-        }
-        const offset = this.node.getBoundingClientRect().y + scroller.scrollTop - scroller.getBoundingClientRect().y;
-        $header.style.top = `${30 - offset}px`;
-        if (anim?.effect?.target !== $header) {
-          anim?.cancel();
-          anim = $header.animate(
-            [{ transform: "translateY(0px)" }, { transform: `translateY(${STICKY_RANGE}px)` }],
-            { timeline: new ScrollTimeline({ source: scroller, axis: "block" }), rangeStart: "0px", rangeEnd: `${STICKY_RANGE}px`, fill: "both", easing: "linear" }
-          );
-          plugin.stickyAnims.set(this, anim);
-        }
-      };
-      t.applyHeaderStickiness();
-      t.refresh();
-      t.ue();
-    }
-    untweak(t) {
-      for (const name of PATCHED) delete t[name];
-      delete t.pagination.setPaginationDetails;
-      delete t.pagination.getPaginationNodes;
-      this.stickyAnims.get(t)?.cancel();
-      this.stickyAnims.delete(t);
-      if (t._destroyed) return;
-      t.pagination.setPaginationDetails(null, NATIVE_PAGE_SIZE, null);
-      t.pagination.refresh();
-      t.applyHeaderStickiness();
-      t.refresh();
-      t.ue();
     }
     /**
      * Native's pager bar (summary, Previous, page select, Next) plus a
@@ -436,17 +499,27 @@ var plugins = (() => {
       const controls = bar.querySelector(".pagination-controls");
       if (!controls) return nodes;
       const sizes = [.../* @__PURE__ */ new Set([...presets, ...size ? [size] : []])].sort((a, b) => a - b);
-      const select = el(`<dropdown-select class='pagination-size-select button-small button-minimal button-minimal-hover' placeholder='Page size'>
+      const select = el(`<dropdown-select class='pagination-size-select button-small button-minimal button-minimal-hover' placeholder='Type any number of rows'>
 				${sizes.map((n) => `<dropdown-option data-value='${n}' ${n === size ? "selected" : ""}>${n} per page</dropdown-option>`).join("")}
 				<dropdown-option data-value='0' ${size ? "" : "selected"}>All rows</dropdown-option>
-				<dropdown-option data-divider></dropdown-option>
-				<dropdown-option data-value='custom'>Custom\u2026</dropdown-option>
 			</dropdown-select>`);
-      select.addEventListener("change", (e) => {
-        if (e.detail.value === "custom") this.customPageSize(t, select);
-        else this.setPageSize(t, Number(e.detail.value));
-      });
+      select.addEventListener("change", (e) => this.setPageSize(t, Number(e.detail.value)));
       controls.prepend(select);
+      queueMicrotask(() => {
+        const options = (
+          /** @type {any} */
+          select.dropdown?.options
+        );
+        if (typeof options?.onPopulate !== "function") return;
+        const populate = options.onPopulate;
+        options.onPopulate = (ac) => {
+          ac.addDynamicOptions?.((query) => {
+            const n = /^\s*\d+\s*$/.test(query) ? Number(query) : 0;
+            return n > 0 && !sizes.includes(n) ? [{ label: `${n} per page`, value: String(n), pinned: true }] : [];
+          });
+          return populate(ac);
+        };
+      });
       const keys = pageKeys();
       for (const [cls, label, action] of [["pagination-prev", "Previous page", "plugin.table_prev_page"], ["pagination-next", "Next page", "plugin.table_next_page"]]) {
         const button = bar.querySelector(`.${cls}`);
@@ -456,29 +529,6 @@ var plugins = (() => {
         button.setAttribute("data-tooltip-html", `${esc(label)} <span class='kbd kbd-subtle'>${kbdLabel(keys[action])}</span>`);
       }
       return [bar];
-    }
-    /** "Custom…": a number field in place of the size select; Enter saves, Escape or leaving it cancels. */
-    customPageSize(t, select) {
-      const input = (
-        /** @type {HTMLInputElement} */
-        el(`<input type='number' min='1' step='1' class='pagination-size-input' placeholder='Rows per page' style='width: 110px'>`)
-      );
-      if (t.pagination.nrItemsPerPage) input.value = String(t.pagination.nrItemsPerPage);
-      const cancel = /* @__PURE__ */ __name(() => t.pagination.refresh(), "cancel");
-      input.addEventListener("keydown", (e) => {
-        e.stopPropagation();
-        if (e.key === "Escape") cancel();
-        if (e.key !== "Enter") return;
-        const n = Number(input.value);
-        if (Number.isInteger(n) && n > 0) this.setPageSize(t, n);
-      });
-      input.addEventListener("blur", () => {
-        if (input.isConnected) cancel();
-      });
-      select.dropdown?.destroy?.();
-      select.replaceWith(input);
-      input.focus();
-      input.select();
     }
     /**
      * The page-turn keys: the focus keeps its row within the page and its
